@@ -14,8 +14,9 @@ type QueryRequest struct {
 
 // QueryResponse is the JSON response body.
 type QueryResponse struct {
-	Data  []engine.Row `json:"data,omitempty"`
-	Error string       `json:"error,omitempty"`
+	Data     []engine.Row          `json:"data,omitempty"`
+	Mutation *engine.MutationResult `json:"mutation,omitempty"`
+	Error    string                `json:"error,omitempty"`
 }
 
 // Handler creates an http.Handler for the sqlike engine.
@@ -38,18 +39,24 @@ func Handler(e *engine.Engine) http.Handler {
 			return
 		}
 
-		rows, err := e.Query(r.Context(), req.Query)
+		qr, err := e.Query(r.Context(), req.Query)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(QueryResponse{Error: err.Error()})
 			return
 		}
 
-		if rows == nil {
-			rows = []engine.Row{}
+		resp := QueryResponse{}
+		if qr.Rows != nil {
+			resp.Data = qr.Rows
+		} else if len(qr.Rows) == 0 && qr.Mutation == nil {
+			resp.Data = []engine.Row{}
+		}
+		if qr.Mutation != nil {
+			resp.Mutation = qr.Mutation
 		}
 
-		json.NewEncoder(w).Encode(QueryResponse{Data: rows})
+		json.NewEncoder(w).Encode(resp)
 	})
 
 	return mux

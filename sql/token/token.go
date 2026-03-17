@@ -52,6 +52,12 @@ const (
 	True
 	False
 	Between
+	Insert
+	Into
+	Values
+	Update
+	Set
+	Delete
 )
 
 // Token represents a single token with its type, literal value, and position.
@@ -86,6 +92,12 @@ var keywords = map[string]Type{
 	"TRUE":    True,
 	"FALSE":   False,
 	"BETWEEN": Between,
+	"INSERT":  Insert,
+	"INTO":    Into,
+	"VALUES":  Values,
+	"UPDATE":  Update,
+	"SET":     Set,
+	"DELETE":  Delete,
 }
 
 // LookupIdent returns the keyword Type for the given identifier,

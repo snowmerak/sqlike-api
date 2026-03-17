@@ -40,8 +40,35 @@ type SourceRequest struct {
 	Conditions []Condition // WHERE conditions for this source
 }
 
-// Resolver is a function that fetches data for a single source.
+// Resolver is a function that fetches data for a single source (SELECT).
 type Resolver func(ctx context.Context, req SourceRequest) ([]Row, error)
+
+// MutationType represents the type of mutation.
+type MutationType string
+
+const (
+	MutationInsert MutationType = "INSERT"
+	MutationUpdate MutationType = "UPDATE"
+	MutationDelete MutationType = "DELETE"
+)
+
+// MutationRequest is passed to a mutation resolver.
+type MutationRequest struct {
+	Type        MutationType
+	Table       string
+	Columns     []string       // INSERT: column names
+	Values      []Row          // INSERT: rows to insert (each Row maps column→value)
+	Assignments Row            // UPDATE: column→new_value
+	Conditions  []Condition    // UPDATE/DELETE: WHERE conditions
+}
+
+// MutationResult is returned from a mutation resolver.
+type MutationResult struct {
+	Affected int64 `json:"affected"`
+}
+
+// MutationResolver is a function that handles INSERT/UPDATE/DELETE.
+type MutationResolver func(ctx context.Context, req MutationRequest) (MutationResult, error)
 
 type sourceEntry struct {
 	columns  []string
@@ -50,13 +77,15 @@ type sourceEntry struct {
 
 // Engine is the sqlike query engine.
 type Engine struct {
-	sources map[string]sourceEntry
+	sources   map[string]sourceEntry
+	mutations map[string]MutationResolver
 }
 
 // New creates a new Engine.
 func New() *Engine {
 	return &Engine{
-		sources: make(map[string]sourceEntry),
+		sources:   make(map[string]sourceEntry),
+		mutations: make(map[string]MutationResolver),
 	}
 }
 
@@ -68,18 +97,57 @@ func (e *Engine) Register(name string, columns []string, resolver Resolver) {
 	}
 }
 
-// Query parses and executes a SQL query, returning flat JSON rows.
-func (e *Engine) Query(ctx context.Context, sql string) ([]Row, error) {
+// RegisterMutation registers a mutation resolver for a table.
+func (e *Engine) RegisterMutation(name string, resolver MutationResolver) {
+	e.mutations[name] = resolver
+}
+
+// QueryResult holds the result of any query type.
+type QueryResult struct {
+	Rows     []Row           `json:"rows,omitempty"`
+	Mutation *MutationResult `json:"mutation,omitempty"`
+}
+
+// Query parses and executes a SQL query.
+func (e *Engine) Query(ctx context.Context, sql string) (*QueryResult, error) {
 	p := parser.New(sql)
 	stmt, err := p.Parse()
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	return e.execute(ctx, stmt)
+
+	switch s := stmt.(type) {
+	case *ast.SelectStatement:
+		rows, err := e.executeSelect(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Rows: rows}, nil
+	case *ast.InsertStatement:
+		result, err := e.executeInsert(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Mutation: &result}, nil
+	case *ast.UpdateStatement:
+		result, err := e.executeUpdate(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Mutation: &result}, nil
+	case *ast.DeleteStatement:
+		result, err := e.executeDelete(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		return &QueryResult{Mutation: &result}, nil
+	default:
+		return nil, fmt.Errorf("unsupported statement type: %T", stmt)
+	}
 }
 
-// execute runs a parsed SELECT statement.
-func (e *Engine) execute(ctx context.Context, stmt *ast.SelectStatement) ([]Row, error) {
+// executeSelect runs a parsed SELECT statement.
+func (e *Engine) executeSelect(ctx context.Context, stmt *ast.SelectStatement) ([]Row, error) {
 	// 1. Collect all sources (FROM + JOINs)
 	sources := e.collectSources(stmt)
 
@@ -648,4 +716,135 @@ func (e *Engine) expandSelectColumns(stmt *ast.SelectStatement, aliasMap map[str
 	}
 
 	return expanded
+}
+
+// executeInsert builds a MutationRequest from an INSERT statement and calls the mutation resolver.
+func (e *Engine) executeInsert(ctx context.Context, stmt *ast.InsertStatement) (MutationResult, error) {
+	resolver, ok := e.mutations[stmt.Table]
+	if !ok {
+		return MutationResult{}, fmt.Errorf("no mutation resolver for table: %s", stmt.Table)
+	}
+
+	rows := make([]Row, len(stmt.Values))
+	for i, vals := range stmt.Values {
+		row := make(Row, len(stmt.Columns))
+		for j, col := range stmt.Columns {
+			lit, ok := vals[j].(ast.Literal)
+			if !ok {
+				return MutationResult{}, fmt.Errorf("INSERT value must be a literal")
+			}
+			row[col] = lit.Value
+		}
+		rows[i] = row
+	}
+
+	return resolver(ctx, MutationRequest{
+		Type:    MutationInsert,
+		Table:   stmt.Table,
+		Columns: stmt.Columns,
+		Values:  rows,
+	})
+}
+
+// executeUpdate builds a MutationRequest from an UPDATE statement and calls the mutation resolver.
+func (e *Engine) executeUpdate(ctx context.Context, stmt *ast.UpdateStatement) (MutationResult, error) {
+	resolver, ok := e.mutations[stmt.Table]
+	if !ok {
+		return MutationResult{}, fmt.Errorf("no mutation resolver for table: %s", stmt.Table)
+	}
+
+	assignments := make(Row, len(stmt.Assignments))
+	for _, a := range stmt.Assignments {
+		lit, ok := a.Value.(ast.Literal)
+		if !ok {
+			return MutationResult{}, fmt.Errorf("UPDATE SET value must be a literal")
+		}
+		assignments[a.Column] = lit.Value
+	}
+
+	conditions := e.extractMutationConditions(stmt.Where)
+
+	return resolver(ctx, MutationRequest{
+		Type:        MutationUpdate,
+		Table:       stmt.Table,
+		Assignments: assignments,
+		Conditions:  conditions,
+	})
+}
+
+// executeDelete builds a MutationRequest from a DELETE statement and calls the mutation resolver.
+func (e *Engine) executeDelete(ctx context.Context, stmt *ast.DeleteStatement) (MutationResult, error) {
+	resolver, ok := e.mutations[stmt.Table]
+	if !ok {
+		return MutationResult{}, fmt.Errorf("no mutation resolver for table: %s", stmt.Table)
+	}
+
+	conditions := e.extractMutationConditions(stmt.Where)
+
+	return resolver(ctx, MutationRequest{
+		Type:       MutationDelete,
+		Table:      stmt.Table,
+		Conditions: conditions,
+	})
+}
+
+// extractMutationConditions extracts flat conditions from a WHERE clause for single-table mutations.
+// Handles both qualified (table.col) and unqualified (col) column references.
+func (e *Engine) extractMutationConditions(where ast.Expression) []Condition {
+	if where == nil {
+		return nil
+	}
+
+	var flat []ast.Expression
+	e.flattenAnd(where, &flat)
+
+	var conditions []Condition
+	for _, expr := range flat {
+		if cond, ok := e.tryExtractMutationCondition(expr); ok {
+			conditions = append(conditions, cond)
+		}
+	}
+	return conditions
+}
+
+func (e *Engine) tryExtractMutationCondition(expr ast.Expression) (Condition, bool) {
+	switch ex := expr.(type) {
+	case ast.BinaryExpr:
+		col, ok := ex.Left.(ast.ColumnRef)
+		if !ok {
+			return Condition{}, false
+		}
+		lit, ok := ex.Right.(ast.Literal)
+		if !ok {
+			return Condition{}, false
+		}
+		op, ok := mapASTOp(ex.Op)
+		if !ok {
+			return Condition{}, false
+		}
+		return Condition{Column: col.Column, Op: op, Value: lit.Value}, true
+
+	case ast.InExpr:
+		if ex.Not {
+			return Condition{}, false
+		}
+		values := make([]any, 0, len(ex.Values))
+		for _, v := range ex.Values {
+			lit, ok := v.(ast.Literal)
+			if !ok {
+				return Condition{}, false
+			}
+			values = append(values, lit.Value)
+		}
+		return Condition{Column: ex.Column.Column, Op: OpIn, Value: values}, true
+
+	case ast.IsNullExpr:
+		op := OpEq
+		if ex.Not {
+			op = OpNeq
+		}
+		return Condition{Column: ex.Column.Column, Op: op, Value: nil}, true
+	}
+
+	return Condition{}, false
 }

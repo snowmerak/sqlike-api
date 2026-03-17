@@ -1,5 +1,10 @@
 package ast
 
+// Statement is the interface for all top-level SQL statements.
+type Statement interface {
+	stmtNode()
+}
+
 // SelectStatement represents a parsed SELECT query.
 type SelectStatement struct {
 	Columns []SelectColumn
@@ -10,6 +15,40 @@ type SelectStatement struct {
 	Limit   *int
 	Offset  *int
 }
+
+func (SelectStatement) stmtNode() {}
+
+// InsertStatement represents INSERT INTO table (cols) VALUES (vals), (vals), ...
+type InsertStatement struct {
+	Table   string
+	Columns []string
+	Values  [][]Expression // each inner slice is one row of values
+}
+
+func (InsertStatement) stmtNode() {}
+
+// UpdateStatement represents UPDATE table SET col = val, ... WHERE ...
+type UpdateStatement struct {
+	Table       string
+	Assignments []Assignment
+	Where       Expression
+}
+
+func (UpdateStatement) stmtNode() {}
+
+// Assignment represents a SET clause item: column = value
+type Assignment struct {
+	Column string
+	Value  Expression
+}
+
+// DeleteStatement represents DELETE FROM table WHERE ...
+type DeleteStatement struct {
+	Table string
+	Where Expression
+}
+
+func (DeleteStatement) stmtNode() {}
 
 // SelectColumn represents a single column in the SELECT clause.
 type SelectColumn struct {

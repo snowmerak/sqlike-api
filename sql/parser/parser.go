@@ -27,9 +27,24 @@ func New(sql string) *Parser {
 	}
 }
 
-// Parse parses a SELECT statement and returns the AST.
-func (p *Parser) Parse() (*ast.SelectStatement, error) {
-	stmt, err := p.parseSelect()
+// Parse parses a SQL statement and returns the AST.
+func (p *Parser) Parse() (ast.Statement, error) {
+	var stmt ast.Statement
+	var err error
+
+	switch p.cur().Type {
+	case token.Select:
+		stmt, err = p.parseSelect()
+	case token.Insert:
+		stmt, err = p.parseInsert()
+	case token.Update:
+		stmt, err = p.parseUpdate()
+	case token.Delete:
+		stmt, err = p.parseDelete()
+	default:
+		return nil, fmt.Errorf("unexpected token %q at position %d, expected SELECT/INSERT/UPDATE/DELETE", p.cur().Literal, p.cur().Pos)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -616,4 +631,167 @@ func (p *Parser) parseOffset() (*int, error) {
 	}
 
 	return &val, nil
+}
+
+// parseInsert parses: INSERT INTO table (col1, col2) VALUES (v1, v2), (v3, v4)
+func (p *Parser) parseInsert() (*ast.InsertStatement, error) {
+	if _, err := p.expect(token.Insert); err != nil {
+		return nil, fmt.Errorf("expected INSERT: %w", err)
+	}
+	if _, err := p.expect(token.Into); err != nil {
+		return nil, fmt.Errorf("expected INTO: %w", err)
+	}
+
+	table, err := p.expect(token.Ident)
+	if err != nil {
+		return nil, fmt.Errorf("expected table name: %w", err)
+	}
+
+	// Parse column list
+	if _, err := p.expect(token.LParen); err != nil {
+		return nil, fmt.Errorf("expected '(' after table name: %w", err)
+	}
+
+	var columns []string
+	for {
+		col, err := p.expect(token.Ident)
+		if err != nil {
+			return nil, fmt.Errorf("expected column name: %w", err)
+		}
+		columns = append(columns, col.Literal)
+		if p.cur().Type != token.Comma {
+			break
+		}
+		p.advance()
+	}
+
+	if _, err := p.expect(token.RParen); err != nil {
+		return nil, fmt.Errorf("expected ')' after columns: %w", err)
+	}
+
+	if _, err := p.expect(token.Values); err != nil {
+		return nil, fmt.Errorf("expected VALUES: %w", err)
+	}
+
+	// Parse value rows
+	var allValues [][]ast.Expression
+	for {
+		if _, err := p.expect(token.LParen); err != nil {
+			return nil, fmt.Errorf("expected '(' for values: %w", err)
+		}
+
+		var rowValues []ast.Expression
+		for {
+			val, err := p.parsePrimary()
+			if err != nil {
+				return nil, fmt.Errorf("parsing value: %w", err)
+			}
+			rowValues = append(rowValues, val)
+			if p.cur().Type != token.Comma {
+				break
+			}
+			p.advance()
+		}
+
+		if _, err := p.expect(token.RParen); err != nil {
+			return nil, fmt.Errorf("expected ')' after values: %w", err)
+		}
+
+		if len(rowValues) != len(columns) {
+			return nil, fmt.Errorf("column count (%d) does not match value count (%d)", len(columns), len(rowValues))
+		}
+
+		allValues = append(allValues, rowValues)
+
+		if p.cur().Type != token.Comma {
+			break
+		}
+		p.advance()
+	}
+
+	return &ast.InsertStatement{
+		Table:   table.Literal,
+		Columns: columns,
+		Values:  allValues,
+	}, nil
+}
+
+// parseUpdate parses: UPDATE table SET col1 = v1, col2 = v2 [WHERE ...]
+func (p *Parser) parseUpdate() (*ast.UpdateStatement, error) {
+	if _, err := p.expect(token.Update); err != nil {
+		return nil, fmt.Errorf("expected UPDATE: %w", err)
+	}
+
+	table, err := p.expect(token.Ident)
+	if err != nil {
+		return nil, fmt.Errorf("expected table name: %w", err)
+	}
+
+	if _, err := p.expect(token.Set); err != nil {
+		return nil, fmt.Errorf("expected SET: %w", err)
+	}
+
+	var assignments []ast.Assignment
+	for {
+		col, err := p.expect(token.Ident)
+		if err != nil {
+			return nil, fmt.Errorf("expected column name in SET: %w", err)
+		}
+		if _, err := p.expect(token.Eq); err != nil {
+			return nil, fmt.Errorf("expected '=' in SET: %w", err)
+		}
+		val, err := p.parsePrimary()
+		if err != nil {
+			return nil, fmt.Errorf("parsing SET value: %w", err)
+		}
+		assignments = append(assignments, ast.Assignment{Column: col.Literal, Value: val})
+		if p.cur().Type != token.Comma {
+			break
+		}
+		p.advance()
+	}
+
+	var where ast.Expression
+	if p.cur().Type == token.Where {
+		p.advance()
+		where, err = p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("parsing WHERE: %w", err)
+		}
+	}
+
+	return &ast.UpdateStatement{
+		Table:       table.Literal,
+		Assignments: assignments,
+		Where:       where,
+	}, nil
+}
+
+// parseDelete parses: DELETE FROM table [WHERE ...]
+func (p *Parser) parseDelete() (*ast.DeleteStatement, error) {
+	if _, err := p.expect(token.Delete); err != nil {
+		return nil, fmt.Errorf("expected DELETE: %w", err)
+	}
+	if _, err := p.expect(token.From); err != nil {
+		return nil, fmt.Errorf("expected FROM: %w", err)
+	}
+
+	table, err := p.expect(token.Ident)
+	if err != nil {
+		return nil, fmt.Errorf("expected table name: %w", err)
+	}
+
+	var where ast.Expression
+	if p.cur().Type == token.Where {
+		p.advance()
+		where, err = p.parseExpression()
+		if err != nil {
+			return nil, fmt.Errorf("parsing WHERE: %w", err)
+		}
+	}
+
+	return &ast.DeleteStatement{
+		Table: table.Literal,
+		Where: where,
+	}, nil
 }
